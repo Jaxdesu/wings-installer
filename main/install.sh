@@ -1,84 +1,129 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -Eeuo pipefail
+IFS=$'\n\t'
 
-LOG_FILE="/root/wings-install.log"
+LOG_FILE="/var/log/wings-installer.log"
+WINGS_DIR="/etc/pterodactyl"
+WINGS_BIN="/usr/local/bin/wings"
+WINGS_SERVICE="/etc/systemd/system/wings.service"
+WINGS_WAS_ACTIVE=false
+STOPPED_WEBSERVERS=()
 
-mkdir -p "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE"
+if [[ -t 1 ]]; then
+    GREEN='\033[0;32m'
+    RED='\033[0;31m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    RESET='\033[0m'
+else
+    GREEN=''
+    RED=''
+    YELLOW=''
+    BLUE=''
+    RESET=''
+fi
 
-exec > >(tee -a "$LOG_FILE") 2>&1
+log()  { printf '%b[OK]%b %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '%b[AVISO]%b %s\n' "$YELLOW" "$RESET" "$*"; }
+err()  { printf '%b[ERRO]%b %s\n' "$RED" "$RESET" "$*" >&2; }
 
-trap 'echo "[ERRO] Linha $LINENO: comando falhou. Veja o log em $LOG_FILE"' ERR
-
-GREEN="\e[32m"
-RED="\e[31m"
-YELLOW="\e[33m"
-BLUE="\e[34m"
-RESET="\e[0m"
-
-log() {
-    echo -e "${GREEN}[OK]${RESET} $1"
+on_error() {
+    local exit_code=$?
+    local line_no=${1:-?}
+    err "Falha na linha ${line_no} (código ${exit_code}). Consulte ${LOG_FILE}."
+    exit "$exit_code"
 }
 
-warn() {
-    echo -e "${YELLOW}[AVISO]${RESET} $1"
+trap 'on_error "$LINENO"' ERR
+
+check_root() {
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        err "Execute este instalador como root (ex.: sudo -i)."
+        exit 1
+    fi
 }
 
-err() {
-    echo -e "${RED}[ERRO]${RESET} $1"
+setup_logging() {
+    install -d -m 0755 "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    chmod 0600 "$LOG_FILE"
+    exec > >(tee -a "$LOG_FILE") 2>&1
 }
 
 ask_yes_no() {
-    local question="$1"
-    local default="$2"
+    local question=$1
+    local default=${2:-n}
     local answer
 
     while true; do
         if [[ "$default" == "s" ]]; then
-            read -rp "$question [S/n]: " answer
-            answer="${answer:-s}"
+            read -r -p "$question [S/n]: " answer || true
+            answer=${answer:-s}
         else
-            read -rp "$question [s/N]: " answer
-            answer="${answer:-n}"
+            read -r -p "$question [s/N]: " answer || true
+            answer=${answer:-n}
         fi
 
-        case "$answer" in
-            s|S|sim|SIM|Sim) return 0 ;;
-            n|N|nao|não|NAO|NÃO|Nao|Não) return 1 ;;
-            *) echo "Responda com s ou n." ;;
+        case "${answer,,}" in
+            s|sim|y|yes) return 0 ;;
+            n|nao|não|no) return 1 ;;
+            *) printf 'Responda com s ou n.\n' ;;
         esac
     done
 }
 
-check_root() {
-    if [[ "$EUID" -ne 0 ]]; then
-        err "Execute como root: sudo su"
+require_systemd() {
+    if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; then
+        err "Este instalador requer uma distribuição Linux usando systemd."
         exit 1
     fi
 }
 
 detect_os() {
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-    else
-        err "Não consegui detectar o sistema operacional."
+    if [[ ! -r /etc/os-release ]]; then
+        err "Não foi possível detectar o sistema operacional."
         exit 1
     fi
 
-    log "Sistema detectado: $PRETTY_NAME"
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    log "Sistema detectado: ${PRETTY_NAME:-${ID:-Linux}}"
+
+    case "${ID:-}" in
+        ubuntu|debian|rhel|rocky|almalinux|centos|fedora) ;;
+        *) warn "Distribuição '${ID:-desconhecida}' não está na lista principal de suporte deste instalador." ;;
+    esac
+}
+
+check_virtualization() {
+    local virt='unknown'
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        virt=$(systemd-detect-virt 2>/dev/null || true)
+        virt=${virt:-none}
+    fi
+
+    case "$virt" in
+        lxc|openvz|vz)
+            warn "Virtualização detectada: $virt. Docker/Wings pode exigir suporte a nesting do provedor."
+            ;;
+        *)
+            log "Virtualização detectada: $virt"
+            ;;
+    esac
 }
 
 install_base_packages() {
-    log "Atualizando pacotes e instalando dependências básicas..."
+    log "Instalando dependências básicas..."
 
-    if command -v apt >/dev/null 2>&1; then
-        apt update
-        apt install -y curl wget tar unzip ca-certificates gnupg lsb-release software-properties-common nano sudo
+    if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends curl ca-certificates gnupg openssl
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl wget tar unzip ca-certificates gnupg nano sudo
+        dnf install -y curl ca-certificates gnupg2 openssl
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl wget tar unzip ca-certificates gnupg nano sudo
+        yum install -y curl ca-certificates gnupg2 openssl
     else
         err "Gerenciador de pacotes não suportado automaticamente."
         exit 1
@@ -87,300 +132,90 @@ install_base_packages() {
 
 install_docker() {
     if command -v docker >/dev/null 2>&1; then
-        log "Docker já está instalado."
+        log "Docker já está instalado: $(docker --version 2>/dev/null || echo 'versão não detectada')"
     else
-        log "Docker não encontrado. Instalando Docker automaticamente..."
-        curl -sSL https://get.docker.com/ | CHANNEL=stable bash
+        log "Docker não encontrado. Instalando Docker CE..."
+        local docker_script
+        docker_script=$(mktemp)
+        curl -fsSL --retry 3 --connect-timeout 15 https://get.docker.com -o "$docker_script"
+        CHANNEL=stable sh "$docker_script"
+        rm -f "$docker_script"
     fi
 
     systemctl enable --now docker
-    log "Docker ativado e iniciado."
+
+    if ! systemctl is-active --quiet docker; then
+        err "Docker foi instalado, mas o serviço não está ativo."
+        systemctl status docker --no-pager || true
+        exit 1
+    fi
+
+    log "Docker habilitado para iniciar automaticamente no boot."
+}
+
+detect_wings_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) printf 'amd64' ;;
+        aarch64|arm64) printf 'arm64' ;;
+        *) return 1 ;;
+    esac
 }
 
 install_wings_binary() {
-    log "Criando diretório /etc/pterodactyl..."
-    mkdir -p /etc/pterodactyl
+    local wings_arch
+    local download_url
+    local tmp_bin
 
-    ARCH="$(uname -m)"
-
-    if [[ "$ARCH" == "x86_64" ]]; then
-        WINGS_ARCH="amd64"
-    elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
-        WINGS_ARCH="arm64"
-    else
-        err "Arquitetura não suportada automaticamente: $ARCH"
+    if ! wings_arch=$(detect_wings_arch); then
+        err "Arquitetura não suportada automaticamente: $(uname -m)"
         exit 1
     fi
 
-    log "Baixando Wings para arquitetura $WINGS_ARCH..."
+    install -d -m 0755 "$WINGS_DIR"
 
-    curl -L -o /usr/local/bin/wings \
-        "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${WINGS_ARCH}"
+    download_url="https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${wings_arch}"
+    tmp_bin=$(mktemp)
 
-    chmod u+x /usr/local/bin/wings
-
-    log "Wings instalado em /usr/local/bin/wings"
-}
-
-install_certbot() {
-    if command -v certbot >/dev/null 2>&1; then
-        log "Certbot já está instalado."
-        return
-    fi
-
-    log "Instalando Certbot..."
-
-    if command -v apt >/dev/null 2>&1; then
-        apt install -y certbot
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y certbot
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y epel-release
-        yum install -y certbot
-    else
-        err "Não consegui instalar o Certbot automaticamente."
+    log "Baixando a versão estável mais recente do Wings (${wings_arch})..."
+    if ! curl -fL --retry 3 --connect-timeout 15 "$download_url" -o "$tmp_bin"; then
+        rm -f "$tmp_bin"
+        err "Falha ao baixar o Wings. O binário atual não foi alterado."
         exit 1
     fi
-}
+    chmod 0755 "$tmp_bin"
 
-issue_ssl() {
-    echo
-    read -rp "Digite o domínio do node/Wings, exemplo node-01.hcraft.cloud: " NODE_DOMAIN
-
-    if [[ -z "$NODE_DOMAIN" ]]; then
-        err "Domínio não pode ficar vazio."
-        exit 1
+    if systemctl is-active --quiet wings 2>/dev/null; then
+        WINGS_WAS_ACTIVE=true
+        log "Wings está ativo. Parando o serviço por alguns segundos para atualizar o binário..."
+        systemctl stop wings
     fi
 
-    read -rp "Digite seu e-mail para o SSL/Let's Encrypt: " SSL_EMAIL
-
-    if [[ -z "$SSL_EMAIL" ]]; then
-        err "E-mail não pode ficar vazio."
-        exit 1
+    if [[ -x "$WINGS_BIN" ]]; then
+        local backup="${WINGS_BIN}.backup.$(date +%Y%m%d-%H%M%S)"
+        cp -a "$WINGS_BIN" "$backup"
+        log "Backup do binário atual criado em $backup"
     fi
 
-    warn "A porta 80 precisa estar livre para gerar SSL com standalone."
-    warn "Se Nginx, Apache ou outro serviço estiver usando a porta 80, o Certbot pode falhar."
-
-    if ask_yes_no "Quer tentar parar nginx/apache temporariamente?" "n"; then
-        systemctl stop nginx 2>/dev/null || true
-        systemctl stop apache2 2>/dev/null || true
-        systemctl stop httpd 2>/dev/null || true
-    fi
-
-    log "Gerando certificado SSL para $NODE_DOMAIN..."
-
-    certbot certonly --standalone \
-        -d "$NODE_DOMAIN" \
-        --non-interactive \
-        --agree-tos \
-        -m "$SSL_EMAIL"
-
-    log "SSL gerado com sucesso."
-
-    echo
-    echo "Certificado:"
-    echo "/etc/letsencrypt/live/$NODE_DOMAIN/fullchain.pem"
-    echo
-    echo "Chave:"
-    echo "/etc/letsencrypt/live/$NODE_DOMAIN/privkey.pem"
-    echo
-}
-
-setup_firewall() {
-    if ! command -v ufw >/dev/null 2>&1; then
-        if command -v apt >/dev/null 2>&1; then
-            apt install -y ufw
-        else
-            warn "UFW não encontrado e instalação automática só foi preparada para Debian/Ubuntu."
-            return 0
+    if ! install -o root -g root -m 0755 "$tmp_bin" "${WINGS_BIN}.new"; then
+        rm -f "$tmp_bin" "${WINGS_BIN}.new"
+        if [[ "$WINGS_WAS_ACTIVE" == true ]]; then
+            systemctl start wings || true
         fi
+        err "Falha ao preparar o novo binário do Wings; a versão atual foi preservada."
+        exit 1
     fi
 
-    warn "Liberando portas comuns do Wings..."
+    mv -f "${WINGS_BIN}.new" "$WINGS_BIN"
+    rm -f "$tmp_bin"
 
-    ufw allow ssh
-    ufw allow 80/tcp
-    ufw allow 443/tcp
-    ufw allow 8080/tcp
-    ufw allow 2022/tcp
-
-    if ask_yes_no "Quer ativar o UFW agora?" "n"; then
-        ufw --force enable
-        log "Firewall ativado."
-    else
-        warn "Regras adicionadas, mas UFW não foi ativado."
-    fi
-
-    ufw status || true
-}
-
-install_mariadb_server() {
-    if systemctl list-unit-files | grep -qE '^mariadb\.service'; then
-        log "MariaDB Server já parece estar instalado."
-        systemctl enable --now mariadb
-        return 0
-    fi
-
-    if systemctl list-unit-files | grep -qE '^mysql\.service'; then
-        log "MySQL Server já parece estar instalado."
-        systemctl enable --now mysql
-        return 0
-    fi
-
-    log "Instalando MariaDB Server local..."
-
-    if command -v apt >/dev/null 2>&1; then
-        apt install -y mariadb-server mariadb-client
-        systemctl enable --now mariadb
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y mariadb-server mariadb
-        systemctl enable --now mariadb
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y mariadb-server mariadb
-        systemctl enable --now mariadb
-    else
-        warn "Não consegui instalar MariaDB Server automaticamente neste sistema."
-        return 0
-    fi
-
-    log "MariaDB Server instalado e iniciado."
-}
-
-install_mariadb_client_if_needed() {
-    if command -v mysql >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
-        log "Cliente MySQL/MariaDB já encontrado."
-        return 0
-    fi
-
-    log "Instalando cliente MariaDB/MySQL..."
-
-    if command -v apt >/dev/null 2>&1; then
-        apt install -y mariadb-client
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y mariadb
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y mariadb
-    else
-        warn "Não consegui instalar cliente MariaDB automaticamente."
-        return 0
-    fi
-}
-
-get_mysql_command() {
-    if command -v mariadb >/dev/null 2>&1; then
-        echo "mariadb"
-    elif command -v mysql >/dev/null 2>&1; then
-        echo "mysql"
-    else
-        echo ""
-    fi
-}
-
-get_mysqladmin_command() {
-    if command -v mariadb-admin >/dev/null 2>&1; then
-        echo "mariadb-admin"
-    elif command -v mysqladmin >/dev/null 2>&1; then
-        echo "mysqladmin"
-    else
-        echo ""
-    fi
-}
-
-setup_database() {
-    echo
-    warn "Wings não precisa de database própria."
-    warn "Essa opção serve para criar uma database para plugins ou servidores."
-
-    if ask_yes_no "Quer instalar MariaDB Server local nesta máquina?" "n"; then
-        install_mariadb_server
-        DB_HOST_DEFAULT="localhost"
-        DB_PORT_DEFAULT="3306"
-    else
-        DB_HOST_DEFAULT="127.0.0.1"
-        DB_PORT_DEFAULT="3306"
-    fi
-
-    install_mariadb_client_if_needed
-
-    MYSQL_CMD="$(get_mysql_command)"
-    MYSQLADMIN_CMD="$(get_mysqladmin_command)"
-
-    if [[ -z "$MYSQL_CMD" ]]; then
-        warn "Cliente MySQL/MariaDB não encontrado. Pulando criação da database."
-        return 0
-    fi
-
-    read -rp "Host do MySQL/MariaDB [$DB_HOST_DEFAULT]: " DB_HOST
-    DB_HOST="${DB_HOST:-$DB_HOST_DEFAULT}"
-
-    read -rp "Porta do MySQL/MariaDB [$DB_PORT_DEFAULT]: " DB_PORT
-    DB_PORT="${DB_PORT:-$DB_PORT_DEFAULT}"
-
-    read -rp "Usuário admin do banco [root]: " DB_ADMIN_USER
-    DB_ADMIN_USER="${DB_ADMIN_USER:-root}"
-
-    read -rsp "Senha do usuário $DB_ADMIN_USER, deixe vazio se for root local sem senha: " DB_ADMIN_PASS
-    echo
-
-    read -rp "Nome da database que deseja criar: " NEW_DB_NAME
-    read -rp "Nome do usuário da database: " NEW_DB_USER
-    read -rsp "Senha para o usuário $NEW_DB_USER: " NEW_DB_PASS
-    echo
-
-    read -rp "Host permitido para o usuário [%]: " NEW_DB_ALLOWED_HOST
-    NEW_DB_ALLOWED_HOST="${NEW_DB_ALLOWED_HOST:-%}"
-
-    if [[ -z "$NEW_DB_NAME" || -z "$NEW_DB_USER" || -z "$NEW_DB_PASS" ]]; then
-        err "Nome da database, usuário e senha não podem ficar vazios."
-        warn "Pulando criação da database."
-        return 0
-    fi
-
-    log "Testando conexão com o banco em $DB_HOST:$DB_PORT..."
-
-    DB_PASS_ARG=()
-    if [[ -n "$DB_ADMIN_PASS" ]]; then
-        DB_PASS_ARG=(-p"$DB_ADMIN_PASS")
-    fi
-
-    if [[ -n "$MYSQLADMIN_CMD" ]]; then
-        if ! "$MYSQLADMIN_CMD" ping -h "$DB_HOST" -P "$DB_PORT" -u "$DB_ADMIN_USER" "${DB_PASS_ARG[@]}" --silent; then
-            err "Não foi possível conectar no banco em $DB_HOST:$DB_PORT"
-            warn "A instalação do Wings vai continuar sem criar a database."
-            warn "Confira se o MariaDB/MySQL está ligado, se a porta está correta e se o host está correto."
-            return 0
-        fi
-    fi
-
-    SQL="
-CREATE DATABASE IF NOT EXISTS \`$NEW_DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS '$NEW_DB_USER'@'$NEW_DB_ALLOWED_HOST' IDENTIFIED BY '$NEW_DB_PASS';
-GRANT ALL PRIVILEGES ON \`$NEW_DB_NAME\`.* TO '$NEW_DB_USER'@'$NEW_DB_ALLOWED_HOST';
-FLUSH PRIVILEGES;
-"
-
-    log "Criando database e usuário..."
-
-    if "$MYSQL_CMD" -h "$DB_HOST" -P "$DB_PORT" -u "$DB_ADMIN_USER" "${DB_PASS_ARG[@]}" -e "$SQL"; then
-        log "Database criada com sucesso."
-
-        echo
-        echo "Database: $NEW_DB_NAME"
-        echo "Usuário: $NEW_DB_USER"
-        echo "Host permitido: $NEW_DB_ALLOWED_HOST"
-        echo
-    else
-        err "Falha ao criar database ou usuário."
-        warn "A instalação do Wings vai continuar mesmo assim."
-        return 0
-    fi
+    log "Wings instalado em $WINGS_BIN"
+    "$WINGS_BIN" --version 2>/dev/null || true
 }
 
 create_wings_service() {
-    log "Criando serviço systemd do Wings..."
+    log "Configurando serviço systemd do Wings..."
 
-    cat > /etc/systemd/system/wings.service <<'EOF'
+    cat > "$WINGS_SERVICE" <<'EOF_SERVICE'
 [Unit]
 Description=Pterodactyl Wings Daemon
 After=docker.service
@@ -400,21 +235,32 @@ RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF_SERVICE
 
+    chmod 0644 "$WINGS_SERVICE"
     systemctl daemon-reload
-    log "Serviço systemd criado."
+
+    # Habilita independentemente de config.yml existir. Assim o Wings fica
+    # registrado para iniciar no boot assim que a configuração estiver presente.
+    systemctl enable wings
+
+    if ! systemctl is-enabled --quiet wings; then
+        err "Não foi possível habilitar o Wings para iniciar no boot."
+        exit 1
+    fi
+
+    log "Wings habilitado para iniciar automaticamente após reinicializações."
 }
 
 check_wings_config() {
-    if [[ -f /etc/pterodactyl/config.yml && -s /etc/pterodactyl/config.yml ]]; then
-        chmod 600 /etc/pterodactyl/config.yml
-        log "Config do Wings encontrada em /etc/pterodactyl/config.yml"
+    if [[ -s "$WINGS_DIR/config.yml" ]]; then
+        chmod 0600 "$WINGS_DIR/config.yml"
+        log "Config encontrada em $WINGS_DIR/config.yml"
         return 0
     fi
 
-    warn "Config do Wings não encontrada em /etc/pterodactyl/config.yml"
-    warn "O Wings foi instalado, mas não será iniciado enquanto a config não existir."
+    warn "Config do Wings ainda não encontrada em $WINGS_DIR/config.yml."
+    warn "O serviço já está habilitado no boot, mas não será iniciado agora sem a configuração."
     return 1
 }
 
@@ -424,55 +270,223 @@ start_wings() {
     fi
 
     log "Iniciando Wings..."
-
-    systemctl enable --now wings
+    systemctl restart wings
     sleep 2
-    systemctl status wings --no-pager || true
+
+    if systemctl is-active --quiet wings; then
+        log "Wings está ativo e habilitado no boot."
+    else
+        err "Wings não permaneceu ativo após a inicialização."
+        journalctl -u wings -n 50 --no-pager || true
+        return 1
+    fi
+}
+
+install_certbot() {
+    if command -v certbot >/dev/null 2>&1; then
+        log "Certbot já está instalado."
+        return 0
+    fi
+
+    log "Instalando Certbot..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y certbot
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y certbot
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y epel-release
+        yum install -y certbot
+    else
+        warn "Não foi possível instalar o Certbot automaticamente."
+        return 1
+    fi
+}
+
+stop_webservers() {
+    local service
+    STOPPED_WEBSERVERS=()
+
+    for service in nginx apache2 httpd caddy; do
+        if systemctl is-active --quiet "$service" 2>/dev/null; then
+            if systemctl stop "$service"; then
+                STOPPED_WEBSERVERS+=("$service")
+                warn "$service foi parado temporariamente para liberar a porta 80."
+            else
+                warn "Não foi possível parar $service automaticamente."
+            fi
+        fi
+    done
+}
+
+restore_webservers() {
+    local service
+    for service in "${STOPPED_WEBSERVERS[@]:-}"; do
+        [[ -n "$service" ]] || continue
+        if systemctl start "$service"; then
+            log "$service iniciado novamente."
+        else
+            warn "Não foi possível reiniciar $service automaticamente."
+        fi
+    done
+    STOPPED_WEBSERVERS=()
+}
+
+cleanup() {
+    if (( ${#STOPPED_WEBSERVERS[@]} > 0 )); then
+        restore_webservers || true
+    fi
+}
+
+trap cleanup EXIT
+
+issue_ssl() {
+    local domain email
+
+    read -r -p "Domínio do node/Wings (ex.: node-01.exemplo.com): " domain
+    if [[ ! "$domain" =~ ^([A-Za-z0-9-]+\.)+[A-Za-z]{2,}$ ]]; then
+        warn "Domínio inválido. Pulando emissão do SSL."
+        return 0
+    fi
+
+    read -r -p "E-mail para Let's Encrypt: " email
+    if [[ ! "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+        warn "E-mail inválido. Pulando emissão do SSL."
+        return 0
+    fi
+
+    warn "O domínio deve apontar para este servidor e a porta 80 deve estar acessível pela internet."
+
+    if ask_yes_no "Parar temporariamente Nginx/Apache/Caddy se estiverem usando a porta 80?" "n"; then
+        stop_webservers
+    fi
+
+    log "Solicitando certificado para $domain..."
+    if certbot certonly --standalone --non-interactive --agree-tos -m "$email" -d "$domain"; then
+        log "SSL emitido com sucesso."
+        printf 'Certificado: /etc/letsencrypt/live/%s/fullchain.pem\n' "$domain"
+        printf 'Chave:       /etc/letsencrypt/live/%s/privkey.pem\n' "$domain"
+
+        install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+        cat > /etc/letsencrypt/renewal-hooks/deploy/restart-wings <<'EOF_HOOK'
+#!/bin/sh
+systemctl try-restart wings >/dev/null 2>&1 || true
+EOF_HOOK
+        chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/restart-wings
+
+        if systemctl list-unit-files certbot.timer >/dev/null 2>&1; then
+            systemctl enable --now certbot.timer || true
+        fi
+
+        systemctl try-restart wings >/dev/null 2>&1 || true
+    else
+        warn "Não foi possível emitir o SSL. O restante da instalação continuará."
+    fi
+
+    restore_webservers
+}
+
+setup_firewall() {
+    local daemon_port sftp_port
+
+    if ! command -v ufw >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get install -y ufw
+        else
+            warn "UFW não está disponível. Configure o firewall manualmente para as portas do Wings."
+            return 0
+        fi
+    fi
+
+    read -r -p "Porta da API do Wings [8080]: " daemon_port
+    daemon_port=${daemon_port:-8080}
+    read -r -p "Porta SFTP do Wings [2022]: " sftp_port
+    sftp_port=${sftp_port:-2022}
+
+    if [[ ! "$daemon_port" =~ ^[0-9]+$ ]] || (( daemon_port < 1 || daemon_port > 65535 )); then
+        warn "Porta da API inválida. Usando 8080."
+        daemon_port=8080
+    fi
+    if [[ ! "$sftp_port" =~ ^[0-9]+$ ]] || (( sftp_port < 1 || sftp_port > 65535 )); then
+        warn "Porta SFTP inválida. Usando 2022."
+        sftp_port=2022
+    fi
+
+    ufw allow 22/tcp
+    ufw allow 80/tcp
+    ufw allow 443/tcp
+    ufw allow "${daemon_port}/tcp"
+    ufw allow "${sftp_port}/tcp"
+
+    if ufw status | grep -q '^Status: active'; then
+        log "UFW já está ativo; regras aplicadas."
+    elif ask_yes_no "Ativar o UFW agora?" "n"; then
+        ufw --force enable
+        log "UFW ativado."
+    else
+        warn "Regras foram adicionadas, mas o UFW continua desativado."
+    fi
+
+    ufw status || true
+}
+
+show_summary() {
+    printf '\n%bResumo%b\n' "$BLUE" "$RESET"
+    printf '%s\n' '--------------------------------------'
+    printf 'Docker: %s / %s\n' \
+        "$(systemctl is-enabled docker 2>/dev/null || true)" \
+        "$(systemctl is-active docker 2>/dev/null || true)"
+    printf 'Wings:  %s / %s\n' \
+        "$(systemctl is-enabled wings 2>/dev/null || true)" \
+        "$(systemctl is-active wings 2>/dev/null || true)"
+    printf 'Config: %s\n' "$WINGS_DIR/config.yml"
+    printf 'Log:    %s\n' "$LOG_FILE"
+    printf '%s\n' '--------------------------------------'
+    printf 'Logs do Wings: journalctl -u wings -f\n'
+    printf 'Status:         systemctl status wings --no-pager\n'
 }
 
 main() {
-    clear
-
-    echo -e "${BLUE}"
-    echo "======================================"
-    echo " Instalador Interativo Pterodactyl Wings"
-    echo "======================================"
-    echo -e "${RESET}"
-
-    echo "Log da instalação:"
-    echo "$LOG_FILE"
-    echo
-
     check_root
+    setup_logging
+    clear 2>/dev/null || true
+
+    printf '%b' "$BLUE"
+    printf '%s\n' '========================================='
+    printf '%s\n' '  Instalador Pterodactyl Wings - Jaxdesu'
+    printf '%s\n' '========================================='
+    printf '%b\n' "$RESET"
+
+    log "Log da instalação: $LOG_FILE"
+
+    require_systemd
     detect_os
+    check_virtualization
     install_base_packages
     install_docker
     install_wings_binary
+    create_wings_service
 
-    if ask_yes_no "Quer gerar SSL com Certbot para o domínio do node?" "s"; then
-        install_certbot
-        issue_ssl
+    # Em atualizações, reduz o tempo de indisponibilidade do daemon.
+    if [[ "$WINGS_WAS_ACTIVE" == true ]]; then
+        start_wings
     fi
 
-    if ask_yes_no "Quer configurar firewall UFW com portas do Wings?" "n"; then
+    if ask_yes_no "Gerar SSL com Certbot para o node?" "n"; then
+        if install_certbot; then
+            issue_ssl
+        fi
+    fi
+
+    if ask_yes_no "Configurar UFW para as portas do Wings?" "n"; then
         setup_firewall
     fi
 
-    if ask_yes_no "Quer criar uma database MySQL/MariaDB opcional?" "n"; then
-        setup_database
+    if [[ "$WINGS_WAS_ACTIVE" != true ]]; then
+        start_wings
     fi
 
-    create_wings_service
-    start_wings
-
+    show_summary
     log "Instalação finalizada."
-    echo "Log salvo em: $LOG_FILE"
-    echo
-    echo "Para ver o log da instalação:"
-    echo "tail -f $LOG_FILE"
-    echo
-    echo "Para ver logs do Wings:"
-    echo "journalctl -u wings -f"
 }
 
-main
+main "$@"
